@@ -1,0 +1,92 @@
+# Terraform pipeline for the homelab/terraform repo
+# - MR pipelines:   fmt + validate + plan (plan summary shown in the MR widget)
+# - main pipelines: fmt + validate + plan, then a manual "apply" button
+# State lives in GitLab-managed Terraform state (Operate > Terraform states).
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages:
+  - validate
+  - plan
+  - apply
+
+variables:
+  TF_VERSION: "1.14.3"            # match `terraform version` on Windows (same or newer)
+  TF_ROOT: ${CI_PROJECT_DIR}/gitlab
+  TF_STATE_NAME: gitlab
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+  # GitLab-managed state, authenticated with the job's own token
+  TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STATE_NAME}
+  TF_HTTP_ADDRESS: ${TF_ADDRESS}
+  TF_HTTP_LOCK_ADDRESS: ${TF_ADDRESS}/lock
+  TF_HTTP_UNLOCK_ADDRESS: ${TF_ADDRESS}/lock
+  TF_HTTP_LOCK_METHOD: POST
+  TF_HTTP_UNLOCK_METHOD: DELETE
+  TF_HTTP_USERNAME: gitlab-ci-token
+  TF_HTTP_PASSWORD: ${CI_JOB_TOKEN}
+  TF_HTTP_RETRY_WAIT_MIN: "5"
+
+  # GitLab provider target (token comes from CI/CD variables, see below)
+  GITLAB_BASE_URL: ${CI_API_V4_URL}
+
+default:
+  image:
+    name: hashicorp/terraform:${TF_VERSION}
+    entrypoint: [""]
+  before_script:
+    - cd "$TF_ROOT"
+
+fmt:
+  stage: validate
+  script:
+    - terraform fmt -check -recursive -diff
+
+validate:
+  stage: validate
+  script:
+    - terraform init -backend=false
+    - terraform validate
+
+plan:
+  stage: plan
+  script:
+    # Plan only reads GitLab, so it uses the read-only token
+    - export GITLAB_TOKEN="$GITLAB_TOKEN_RO"
+    - terraform init
+    # -lock=false: MR plans (including Renovate's) never hold the state lock
+    - terraform plan -lock=false -out=plan.cache
+    - apk add --no-cache jq
+    - >
+      terraform show -json plan.cache |
+      jq -r '([.resource_changes[]?.change.actions?] | flatten)
+      | {"create": (map(select(. == "create")) | length),
+         "update": (map(select(. == "update")) | length),
+         "delete": (map(select(. == "delete")) | length)}'
+      > plan.json
+  artifacts:
+    name: plan
+    paths:
+      - gitlab/plan.cache
+    reports:
+      terraform: gitlab/plan.json
+    expire_in: 1 week
+
+apply:
+  stage: apply
+  # GITLAB_TOKEN (full api scope) is a protected variable, only available on main
+  script:
+    - terraform init
+    - terraform apply -input=false plan.cache
+  needs:
+    - plan
+  resource_group: terraform-gitlab
+  environment:
+    name: gitlab-config
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
